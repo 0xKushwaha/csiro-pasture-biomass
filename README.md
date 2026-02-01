@@ -1,6 +1,6 @@
 # CSIRO Pasture Biomass Prediction Challenge
 
-🥈 **Silver Medal Solution - Rank 138/1000+ teams**
+🥈 **Silver Medal Solution - Rank 138/3802 teams**
 
 Deep learning solution for predicting pasture biomass components from aerial imagery using vision transformers and biological constraint enforcement.
 
@@ -8,7 +8,7 @@ Deep learning solution for predicting pasture biomass components from aerial ima
 
 ## 📊 Competition Overview
 
-**Competition**: [CSIRO Pasture Biomass Prediction](https://www.kaggle.com/competitions/csiro-pasture-biomass)
+**Competition**: [CSIRO Pasture Biomass Prediction](https://www.kaggle.com/competitions/csiro-biomass)
 
 **Objective**: Predict five biomass components from 2000×1000 pixel pasture images:
 - Dry Green Biomass (g/m²)
@@ -29,7 +29,7 @@ Deep learning solution for predicting pasture biomass components from aerial ima
 ## 🏆 Results
 
 - **Public Leaderboard**: Rank 138 (Silver Medal)
-- **Final Score**: ~0.70+ R²
+- **Final Score**: ~0.62+ R²
 - **Key Innovation**: Biological constraint enforcement through architectural design
 
 ---
@@ -217,17 +217,3 @@ python src/inference.py --checkpoint path/to/checkpoint.pth --output submissions
 - Pre-trained vision transformer authors (DINOv2, DINOv3)
 
 ---
-
-## 📄 License
-
-MIT License - See LICENSE file for details
-
----
-
-## 📧 Contact
-
-Feel free to reach out for questions or collaborations!
-
-- **GitHub**: [@yourusername](https://github.com/yourusername)
-- **LinkedIn**: [Your Profile](https://linkedin.com/in/yourprofile)
-- **Email**: your.email@example.com
