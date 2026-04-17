@@ -11,16 +11,13 @@ import argparse
 
 import numpy as np
 import pandas as pd
-import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import timm
+import yaml
 from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import r2_score
@@ -28,9 +25,12 @@ import gc
 import warnings
 warnings.filterwarnings("ignore")
 
+from dataset import BiomassDataset, BiomassDatasetMulti, collate_fn, get_train_transforms, get_val_transforms
+from models.dual_crop_vit import BiomassModelSingle, set_backbone_grad
+
 
 class CFG:
-    DATA_DIR = Path("/home/ayush/Documents/Kaggle_comp/bio-mass/csiro-biomass")
+    DATA_DIR = Path("./data")
     OUTPUT_DIR = Path("./v2_trained")
 
     MODEL_NAME = "vit_huge_plus_patch16_dinov3.lvd1689m"
@@ -52,13 +52,49 @@ class CFG:
     GRAD_CLIP = 0.5
 
     USE_LOG_TRANSFORM = False
-    TARGETS = ["dead", "clover", "green"]  # Training order
+    TARGETS = ["dead", "clover", "green"]
     TARGET_COLS = {"dead": "Dry_Dead_g", "clover": "Dry_Clover_g", "green": "Dry_Green_g"}
 
     WARMUP_EPOCHS = 3
     USE_AMP = True
     SEED = 42
     DEBUG = False
+
+
+def load_config_from_yaml(cfg, yaml_path):
+    with open(yaml_path) as f:
+        yaml_cfg = yaml.safe_load(f)
+
+    data = yaml_cfg.get("data", {})
+    if "train_image_dir" in data:
+        cfg.DATA_DIR = Path(data["train_image_dir"]).parent
+    if "image_size" in data:
+        cfg.IMG_SIZE = data["image_size"]
+
+    model_cfg = yaml_cfg.get("model", {})
+    if "model_name" in model_cfg:
+        cfg.MODEL_NAME = model_cfg["model_name"]
+    if "grad_checkpointing" in model_cfg:
+        cfg.GRAD_CHECKPOINTING = model_cfg["grad_checkpointing"]
+
+    training_map = {
+        "batch_size": "BATCH_SIZE",
+        "accumulation_steps": "ACCUMULATION_STEPS",
+        "n_folds": "N_FOLDS",
+        "epochs": "EPOCHS",
+        "freeze_epochs": "FREEZE_EPOCHS",
+        "lr_backbone": "LR_BACKBONE",
+        "lr_head": "LR_HEAD",
+        "weight_decay": "WD",
+        "grad_clip": "GRAD_CLIP",
+        "use_amp": "USE_AMP",
+        "use_log_transform": "USE_LOG_TRANSFORM",
+    }
+    for yaml_key, cfg_key in training_map.items():
+        if yaml_key in yaml_cfg.get("training", {}):
+            setattr(cfg, cfg_key, yaml_cfg["training"][yaml_key])
+
+    return cfg
 
 
 def seed_everything(seed=42):
@@ -71,153 +107,7 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-def get_train_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
-        A.Rotate(limit=(-10, 10), p=0.3, border_mode=cv2.BORDER_REFLECT_101),
-        #A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.5),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2()
-    ])
-
-
-def get_val_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2()
-    ])
-
-
-class BiomassDataset(Dataset):
-    """Single-target dataset for training individual models."""
-    def __init__(self, df, transform, img_dir, target_col, use_log_transform=True, is_training=True):
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
-        self.img_dir = img_dir
-        self.target_col = target_col
-        self.use_log_transform = use_log_transform
-        self.is_training = is_training
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = cv2.imread(str(self.img_dir / row["image_path"]))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w = img.shape[:2]
-
-        left = img[:, :h]
-        right = img[:, w - h:]
-
-        # Synchronized augmentation: same transform for both crops
-        if self.is_training:
-            seed = random.randint(0, 2**31)
-            random.seed(seed)
-            np.random.seed(seed)
-            left = self.transform(image=left)['image']
-            random.seed(seed)
-            np.random.seed(seed)
-            right = self.transform(image=right)['image']
-        else:
-            left = self.transform(image=left)['image']
-            right = self.transform(image=right)['image']
-
-        target = row[self.target_col]
-        if self.use_log_transform:
-            target = np.log1p(target + 1e-6)
-
-        return (left, right), torch.tensor(target, dtype=torch.float32)
-
-
-class BiomassDatasetMulti(Dataset):
-    """Multi-target dataset for final validation (returns all targets)."""
-    def __init__(self, df, transform, img_dir, use_log_transform=True):
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
-        self.img_dir = img_dir
-        self.use_log_transform = use_log_transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = cv2.imread(str(self.img_dir / row["image_path"]))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w = img.shape[:2]
-
-        left = img[:, :h]
-        right = img[:, w - h:]
-
-        left = self.transform(image=left)['image']
-        right = self.transform(image=right)['image']
-
-        green, dead, clover = row["Dry_Green_g"], row["Dry_Dead_g"], row["Dry_Clover_g"]
-
-        if self.use_log_transform:
-            eps = 1e-6
-            green, dead, clover = np.log1p(green + eps), np.log1p(dead + eps), np.log1p(clover + eps)
-
-        targets = torch.tensor([green, dead, clover], dtype=torch.float32)
-        return (left, right), targets
-
-
-def collate_fn(batch):
-    imgs1 = torch.stack([b[0][0] for b in batch])
-    imgs2 = torch.stack([b[0][1] for b in batch])
-    targets = torch.stack([b[1] for b in batch])
-    return (imgs1, imgs2), targets
-
-
-class LocalMambaBlock(nn.Module):
-    def __init__(self, dim, kernel_size=5, dropout=0.1):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.dwconv = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim)
-        self.gate = nn.Linear(dim, dim)
-        self.proj = nn.Linear(dim, dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        shortcut = x
-        x = self.norm(x)
-        x = x * torch.sigmoid(self.gate(x))
-        x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
-        return shortcut + self.drop(self.proj(x))
-
-
-class BiomassModelSingle(nn.Module):
-    """Single-target model with its own backbone, fusion, and head."""
-    def __init__(self, model_name, pretrained=True):
-        super().__init__()
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0, global_pool='')
-
-        if hasattr(self.backbone, 'set_grad_checkpointing') and CFG.GRAD_CHECKPOINTING:
-            self.backbone.set_grad_checkpointing(True)
-
-        nf = self.backbone.num_features
-        self.fusion = nn.Sequential(
-            LocalMambaBlock(nf, kernel_size=5, dropout=0.2),
-            LocalMambaBlock(nf, kernel_size=5, dropout=0.2)
-        )
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Sequential(nn.Linear(nf, nf // 2), nn.GELU(), nn.Dropout(0.35), nn.Linear(nf // 2, 1))
-
-    def forward(self, x):
-        left, right = x
-        x_l, x_r = self.backbone(left), self.backbone(right)
-        x_fused = self.fusion(torch.cat([x_l, x_r], dim=1))
-        x_pool = self.pool(x_fused.transpose(1, 2)).flatten(1)
-        return self.head(x_pool).squeeze(-1)
-
-
 class RMSELoss(nn.Module):
-    """Single-target RMSE loss."""
     def __init__(self):
         super().__init__()
 
@@ -235,11 +125,6 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def set_backbone_grad(model, requires_grad):
-    for p in model.backbone.parameters():
-        p.requires_grad = requires_grad
-
-
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg, target_name):
     model.train()
     running_loss = 0.0
@@ -248,7 +133,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg, ta
     for step, ((imgs1, imgs2), targets) in enumerate(tqdm(loader, desc=f"Train [{target_name}]", leave=False)):
         imgs1, imgs2, targets = imgs1.to(device), imgs2.to(device), targets.to(device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+        with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
             loss = criterion(model((imgs1, imgs2)), targets) / cfg.ACCUMULATION_STEPS
 
         scaler.scale(loss).backward()
@@ -267,7 +152,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg, ta
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, cfg, target_name):
-    """Validate single-target model."""
     model.eval()
     all_preds, all_targets = [], []
     running_loss = 0.0
@@ -275,7 +159,7 @@ def validate(model, loader, criterion, device, cfg, target_name):
     for (imgs1, imgs2), targets in tqdm(loader, desc=f"Valid [{target_name}]", leave=False):
         imgs1, imgs2, targets = imgs1.to(device), imgs2.to(device), targets.to(device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+        with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
             preds = model((imgs1, imgs2))
             loss = criterion(preds, targets)
 
@@ -290,19 +174,13 @@ def validate(model, loader, criterion, device, cfg, target_name):
         all_targets.append(targets_np)
 
     all_preds, all_targets = np.concatenate(all_preds), np.concatenate(all_targets)
-
     rmse = np.sqrt(np.mean((all_preds - all_targets) ** 2))
     r2 = r2_score(all_targets, all_preds)
 
-    return {
-        "val_loss": running_loss / len(loader),
-        "rmse": rmse,
-        "r2": r2
-    }
+    return {"val_loss": running_loss / len(loader), "rmse": rmse, "r2": r2}
 
 
 def create_folds(df, target_col, n_folds, seed):
-    """Create stratified folds based on target-specific binning."""
     df = df.copy()
     df["target_bin"] = pd.qcut(df[target_col], q=10, labels=False, duplicates="drop")
 
@@ -316,7 +194,6 @@ def create_folds(df, target_col, n_folds, seed):
 
 
 def train_fold(fold, train_df, target_name, target_col, cfg, device):
-    """Train a single-target model for one fold."""
     print(f"\n{'-'*40}\nFold {fold} [{target_name}]\n{'-'*40}")
 
     train_data = train_df[train_df["fold"] != fold].reset_index(drop=True)
@@ -334,7 +211,7 @@ def train_fold(fold, train_df, target_name, target_col, cfg, device):
         pin_memory=True, collate_fn=collate_fn
     )
 
-    model = BiomassModelSingle(cfg.MODEL_NAME, pretrained=True).to(device)
+    model = BiomassModelSingle(cfg.MODEL_NAME, pretrained=True, grad_checkpointing=cfg.GRAD_CHECKPOINTING).to(device)
 
     backbone_params = list(model.backbone.parameters())
     head_params = [p for n, p in model.named_parameters() if "backbone" not in n]
@@ -346,17 +223,15 @@ def train_fold(fold, train_df, target_name, target_col, cfg, device):
 
     scheduler = get_scheduler(optimizer, cfg.WARMUP_EPOCHS, cfg.EPOCHS)
     criterion = RMSELoss()
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     best_rmse, best_epoch, patience_counter = float("inf"), 0, 0
 
-    # Freeze backbone initially
     if cfg.FREEZE_EPOCHS > 0:
         set_backbone_grad(model, False)
         print(f"Backbone frozen for first {cfg.FREEZE_EPOCHS} epochs")
 
     for epoch in range(1, cfg.EPOCHS + 1):
-        # Unfreeze backbone after FREEZE_EPOCHS
         if epoch == cfg.FREEZE_EPOCHS + 1:
             set_backbone_grad(model, True)
             print("Backbone unfrozen")
@@ -389,11 +264,9 @@ def train_fold(fold, train_df, target_name, target_col, cfg, device):
 
 
 def train_target(target_name, train_wide, cfg, device):
-    """Train all folds for a single target."""
     target_col = cfg.TARGET_COLS[target_name]
     print(f"\n{'='*60}\nTraining Target: {target_name.upper()} (binned by {target_col})\n{'='*60}")
 
-    # Create folds with target-specific binning
     train_df = create_folds(train_wide, target_col, cfg.N_FOLDS, cfg.SEED)
 
     scores = []
@@ -411,15 +284,9 @@ def train_target(target_name, train_wide, cfg, device):
 
 @torch.no_grad()
 def final_validation(train_wide, cfg, device):
-    """
-    Load all trained models and compute combined metrics (GDM, Total).
-    Uses green model's fold splits for final validation since green is trained last.
-    """
     print(f"\n{'='*60}\nFinal Combined Validation\n{'='*60}")
 
-    # Use green's binning for final validation (since green is trained last)
     train_df = create_folds(train_wide, cfg.TARGET_COLS["green"], cfg.N_FOLDS, cfg.SEED)
-
     all_fold_metrics = []
 
     for fold in cfg.TRAIN_FOLDS:
@@ -432,11 +299,10 @@ def final_validation(train_wide, cfg, device):
             pin_memory=True, collate_fn=collate_fn
         )
 
-        # Load models for this fold
         models = {}
         for target_name in ["green", "dead", "clover"]:
-            model = BiomassModelSingle(cfg.MODEL_NAME, pretrained=False).to(device)
-            model.load_state_dict(torch.load(cfg.OUTPUT_DIR / f"fold{fold}_{target_name}_best.pth", map_location=device))
+            model = BiomassModelSingle(cfg.MODEL_NAME, pretrained=False, grad_checkpointing=False).to(device)
+            model.load_state_dict(torch.load(cfg.OUTPUT_DIR / f"fold{fold}_{target_name}_best.pth", map_location=device, weights_only=True))
             model.eval()
             models[target_name] = model
 
@@ -446,12 +312,12 @@ def final_validation(train_wide, cfg, device):
         for (imgs1, imgs2), targets in tqdm(valid_loader, desc=f"Final Valid [Fold {fold}]", leave=False):
             imgs1, imgs2 = imgs1.to(device), imgs2.to(device)
 
-            with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+            with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
                 pred_green = models["green"]((imgs1, imgs2)).cpu().numpy()
                 pred_dead = models["dead"]((imgs1, imgs2)).cpu().numpy()
                 pred_clover = models["clover"]((imgs1, imgs2)).cpu().numpy()
 
-            targets_np = targets.numpy()  # [green, dead, clover]
+            targets_np = targets.numpy()
 
             if cfg.USE_LOG_TRANSFORM:
                 pred_green = np.expm1(np.clip(pred_green, -20, 20))
@@ -466,18 +332,15 @@ def final_validation(train_wide, cfg, device):
             all_targets["dead"].append(targets_np[:, 1])
             all_targets["clover"].append(targets_np[:, 2])
 
-        # Concatenate all predictions and targets
         for k in all_preds:
             all_preds[k] = np.concatenate(all_preds[k])
             all_targets[k] = np.concatenate(all_targets[k])
 
-        # Compute derived targets
         pred_gdm = all_preds["green"] + all_preds["clover"]
         pred_total = all_preds["green"] + all_preds["dead"] + all_preds["clover"]
         target_gdm = all_targets["green"] + all_targets["clover"]
         target_total = all_targets["green"] + all_targets["dead"] + all_targets["clover"]
 
-        # Calculate metrics
         metrics = {}
         for name in ["green", "dead", "clover"]:
             metrics[f"rmse_{name}"] = np.sqrt(np.mean((all_preds[name] - all_targets[name]) ** 2))
@@ -488,19 +351,16 @@ def final_validation(train_wide, cfg, device):
         metrics["rmse_total"] = np.sqrt(np.mean((pred_total - target_total) ** 2))
         metrics["r2_total"] = r2_score(target_total, pred_total)
 
-        # Print fold results
         print(f"  {'Target':<8} {'RMSE':<12} {'R2':<12}")
         for name in ["green", "dead", "clover", "gdm", "total"]:
             print(f"  {name:<8} {metrics[f'rmse_{name}']:<12.4f} {metrics[f'r2_{name}']:<12.4f}")
 
         all_fold_metrics.append(metrics)
 
-        # Clean up models
         for m in models.values():
             del m
         torch.cuda.empty_cache()
 
-    # Compute mean metrics across folds
     print(f"\n{'='*60}\nMean Metrics Across Folds\n{'='*60}")
     print(f"  {'Target':<8} {'RMSE':<12} {'R2':<12}")
     for name in ["green", "dead", "clover", "gdm", "total"]:
@@ -513,12 +373,17 @@ def final_validation(train_wide, cfg, device):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--folds", type=str, default="0,1,2,3")
     parser.add_argument("--skip_training", action="store_true", help="Skip training and only run final validation")
     args = parser.parse_args()
 
     cfg = CFG()
+
+    if args.config:
+        cfg = load_config_from_yaml(cfg, args.config)
+
     cfg.DEBUG = args.debug
     cfg.TRAIN_FOLDS = [int(f) for f in args.folds.split(",")]
 
@@ -538,19 +403,16 @@ def main():
         cfg.EPOCHS = 2
 
     if not args.skip_training:
-        # Train each target sequentially: dead -> clover -> green
         all_scores = {}
-        for target_name in cfg.TARGETS:  # ["dead", "clover", "green"]
+        for target_name in cfg.TARGETS:
             scores = train_target(target_name, train_wide, cfg, device)
             all_scores[target_name] = scores
 
-        # Print summary
         print(f"\n{'='*60}\nTraining Summary\n{'='*60}")
         for target_name in cfg.TARGETS:
             mean_score = np.mean(all_scores[target_name])
             print(f"{target_name.upper()}: Mean RMSE = {mean_score:.4f}")
 
-    # Final combined validation
     final_validation(train_wide, cfg, device)
 
     print(f"\n{'='*60}\nAll Done!\n{'='*60}")
@@ -558,4 +420,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
