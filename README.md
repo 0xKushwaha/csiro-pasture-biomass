@@ -1,6 +1,6 @@
 # CSIRO Pasture Biomass Prediction Challenge
 
-**Silver Medal Solution - Rank 138/3802 teams**
+**Silver Medal Solution - Rank 140/3802 teams**
 
 Deep learning solution for predicting pasture biomass components from aerial imagery using a dual-crop Vision Transformer with a Selective State Space Model (SSM) fusion layer.
 
