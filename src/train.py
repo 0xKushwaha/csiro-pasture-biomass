@@ -133,7 +133,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg, ta
     for step, ((imgs1, imgs2), targets) in enumerate(tqdm(loader, desc=f"Train [{target_name}]", leave=False)):
         imgs1, imgs2, targets = imgs1.to(device), imgs2.to(device), targets.to(device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+        with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
             loss = criterion(model((imgs1, imgs2)), targets) / cfg.ACCUMULATION_STEPS
 
         scaler.scale(loss).backward()
@@ -159,7 +159,7 @@ def validate(model, loader, criterion, device, cfg, target_name):
     for (imgs1, imgs2), targets in tqdm(loader, desc=f"Valid [{target_name}]", leave=False):
         imgs1, imgs2, targets = imgs1.to(device), imgs2.to(device), targets.to(device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+        with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
             preds = model((imgs1, imgs2))
             loss = criterion(preds, targets)
 
@@ -223,7 +223,7 @@ def train_fold(fold, train_df, target_name, target_col, cfg, device):
 
     scheduler = get_scheduler(optimizer, cfg.WARMUP_EPOCHS, cfg.EPOCHS)
     criterion = RMSELoss()
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     best_rmse, best_epoch, patience_counter = float("inf"), 0, 0
 
@@ -302,7 +302,7 @@ def final_validation(train_wide, cfg, device):
         models = {}
         for target_name in ["green", "dead", "clover"]:
             model = BiomassModelSingle(cfg.MODEL_NAME, pretrained=False, grad_checkpointing=False).to(device)
-            model.load_state_dict(torch.load(cfg.OUTPUT_DIR / f"fold{fold}_{target_name}_best.pth", map_location=device))
+            model.load_state_dict(torch.load(cfg.OUTPUT_DIR / f"fold{fold}_{target_name}_best.pth", map_location=device, weights_only=True))
             model.eval()
             models[target_name] = model
 
@@ -312,7 +312,7 @@ def final_validation(train_wide, cfg, device):
         for (imgs1, imgs2), targets in tqdm(valid_loader, desc=f"Final Valid [Fold {fold}]", leave=False):
             imgs1, imgs2 = imgs1.to(device), imgs2.to(device)
 
-            with torch.cuda.amp.autocast(enabled=cfg.USE_AMP):
+            with torch.amp.autocast('cuda', enabled=cfg.USE_AMP):
                 pred_green = models["green"]((imgs1, imgs2)).cpu().numpy()
                 pred_dead = models["dead"]((imgs1, imgs2)).cpu().numpy()
                 pred_clover = models["clover"]((imgs1, imgs2)).cpu().numpy()
