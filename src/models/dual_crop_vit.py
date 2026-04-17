@@ -10,15 +10,20 @@ import timm
 
 class LocalMambaBlock(nn.Module):
     """
-    Local Mamba-inspired block for sequential feature fusion.
-    Uses depthwise convolution with gating mechanism.
+    Simplified Mamba SSM block for sequential feature fusion.
+    Implements a selective state space model: h_t = A*h_{t-1} + B_t*x_t, y_t = C_t*h_t + D*x_t
+    Input-dependent B and C make it selective (like Mamba), gated by z branch.
     """
-    def __init__(self, dim, kernel_size=5, dropout=0.1):
+    def __init__(self, dim, d_state=16, dropout=0.1):
         super().__init__()
+        self.d_state = d_state
         self.norm = nn.LayerNorm(dim)
-        self.dwconv = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim)
-        self.gate = nn.Linear(dim, dim)
-        self.proj = nn.Linear(dim, dim)
+        self.in_proj = nn.Linear(dim, dim * 2)      # splits into x and gate z
+        self.B_proj = nn.Linear(dim, d_state)        # input-dependent B (selective)
+        self.C_proj = nn.Linear(dim, d_state)        # input-dependent C (selective)
+        self.A = nn.Parameter(torch.randn(dim, d_state))  # state transition matrix
+        self.D = nn.Parameter(torch.ones(dim))       # skip connection scalar
+        self.out_proj = nn.Linear(dim, dim)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -30,9 +35,27 @@ class LocalMambaBlock(nn.Module):
         """
         shortcut = x
         x = self.norm(x)
-        x = x * torch.sigmoid(self.gate(x))
-        x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
-        return shortcut + self.drop(self.proj(x))
+
+        xz = self.in_proj(x)
+        x_ssm, z = xz.chunk(2, dim=-1)             # [B, L, dim] each
+
+        B_mat = self.B_proj(x_ssm)                  # [B, L, d_state]
+        C_mat = self.C_proj(x_ssm)                  # [B, L, d_state]
+        A = -torch.exp(self.A)                       # [dim, d_state] kept negative for stability
+
+        batch, seq_len, dim = x_ssm.shape
+        h = torch.zeros(batch, dim, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(seq_len):
+            h = h * A.unsqueeze(0) + x_ssm[:, t, :].unsqueeze(-1) * B_mat[:, t, :].unsqueeze(1)
+            y_t = (h * C_mat[:, t, :].unsqueeze(1)).sum(-1)  # [B, dim]
+            ys.append(y_t)
+
+        y = torch.stack(ys, dim=1)                  # [B, L, dim]
+        y = y + x_ssm * self.D                      # skip connection
+        y = y * torch.sigmoid(z)                    # selective gate
+
+        return shortcut + self.drop(self.out_proj(y))
 
 
 class BiomassModelSingle(nn.Module):
@@ -74,8 +97,8 @@ class BiomassModelSingle(nn.Module):
         
         # Fusion layers: 2 LocalMambaBlocks
         self.fusion = nn.Sequential(
-            LocalMambaBlock(nf, kernel_size=5, dropout=0.2),
-            LocalMambaBlock(nf, kernel_size=5, dropout=0.2)
+            LocalMambaBlock(nf, d_state=16, dropout=0.2),
+            LocalMambaBlock(nf, d_state=16, dropout=0.2)
         )
         
         # Pooling

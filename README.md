@@ -42,7 +42,7 @@ Deep learning solution for predicting pasture biomass components from aerial ima
    - Only 3 of 5 targets are mathematically independent
    - GDM = Green + Clover
    - Total = Green + Dead + Clover
-   - Enforcing these constraints improved performance significantly
+   - Deriving GDM and Total from base predictions at inference guarantees consistency and outperformed training a separate model for each
 
 2. **Multi-Crop Architecture**
    - Wide 2000×1000 images require careful handling
@@ -138,7 +138,7 @@ Single Target Output
 - **Framework**: PyTorch
 - **Vision Models**: timm, transformers (HuggingFace)
 - **Augmentation**: Albumentations
-- **Ensemble**: XGBoost, LightGBM, CatBoost
+- **Ensemble**: 4-fold cross-validation with prediction averaging
 - **Compute**: Kaggle (2× Tesla T4 / A100 80GB)
 
 ---
@@ -156,8 +156,7 @@ csiro-pasture-biomass/
 ├── src/
 │   ├── dataset.py            # Custom dataset classes
 │   ├── models/
-│   │   ├── dual_crop_vit.py  # Dual-crop architecture
-│   │   └── constraint_head.py # Biological constraint layer
+│   │   └── dual_crop_vit.py  # Dual-crop architecture with SSM fusion
 │   ├── train.py              # Training pipeline
 │   └── inference.py          # Inference script
 ├── configs/
@@ -185,13 +184,15 @@ Download competition data from [Kaggle](https://www.kaggle.com/competitions/csir
 ### Training
 
 ```bash
+python src/train.py
+# or with YAML config override:
 python src/train.py --config configs/dinov2_base.yaml
 ```
 
 ### Inference
 
 ```bash
-python src/inference.py --checkpoint path/to/checkpoint.pth --output submissions/
+python src/inference.py
 ```
 
 ---

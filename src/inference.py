@@ -17,17 +17,16 @@ from models.dual_crop_vit import BiomassModelSingle
 class Config:
     """Configuration for inference"""
     DATA_DIR = Path("./data")
-    MODEL_DIR = Path("./checkpoints")  # Directory with trained models
+    MODEL_DIR = Path("./v2_trained")
     OUTPUT_DIR = Path("./submissions")
-    
+
     MODEL_NAME = "vit_huge_plus_patch16_dinov3.lvd1689m"
     IMG_SIZE = 512
     BATCH_SIZE = 8
     NUM_WORKERS = 4
     N_FOLDS = 4
-    
+
     USE_LOG_TRANSFORM = False
-    USE_TTA = False  # Test-time augmentation
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
